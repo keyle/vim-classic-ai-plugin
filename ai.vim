@@ -17,13 +17,22 @@
 "                           cannot corrupt natural-language questions the
 "                           way they do in ":Ai <question>" or input().
 "                           With a visual selection (v/V then :Ai) the
-"                           answer is about that selection: code changes
-"                           (rewrite/implement/fix...) replace it in place,
-"                           questions open as Markdown below. With NO
+"                           answer is about that selection. The MODEL decides
+"                           how to answer — there is no keyword guessing in
+"                           Vim: its reply MUST start with a routing token
+"                           on the very first line, <_incode_> for code it
+"                           wants spliced into the selection as the
+"                           replacement, or <_scratchpad_> for a Markdown
+"                           explanation/answer shown in a scratch window
+"                           below (code untouched). Write your intent
+"                           naturally; the model judges it. With NO
 "                           selection it is a blank canvas — the question
-"                           is sent alone, ChatGPT-style, and the answer
-"                           opens in the Markdown window below; nothing in
-"                           the buffer is touched.
+"                           is sent alone, ChatGPT-style, the model is told
+"                           to use <_scratchpad_>, and the answer opens in
+"                           the Markdown window below; nothing in the
+"                           buffer is touched. If the model omits the token,
+"                           the reply defaults to the scratchpad so code is
+"                           never overwritten by accident.
 "                           The model gets the file name + filetype as a
 "                           hint and the selection as context when present
 "                           — still no disk/network tools.
@@ -35,8 +44,8 @@
 "                           cnoreabbrev expands typed words — press Ctrl-V
 "                           before a word ("<C-v>make") to bypass it.
 "   :%Ai <question>         whole buffer counts as the selection (asks for
-"                           confirm before a code replace; questions only
-"                           open the Markdown buffer).
+"                           confirm before a code replace; <_scratchpad_>
+"                           answers only open the Markdown buffer).
 "   :Ait                    show last request/reasoning/response in a
 "                           temporary scratch buffer.
 "
@@ -71,7 +80,7 @@ let g:ai_api_url = get(g:, 'ai_api_url', 'https://openrouter.ai/api/v1/chat/comp
 let g:ai_prompt_height = get(g:, 'ai_prompt_height', 5)
 let g:ai_response_height = get(g:, 'ai_response_height', 42)
 let g:ai_system = get(g:, 'ai_system',
-      \ 'You are a helpful coding assistant inside Vim. When asked to modify code, return ONLY the replacement text with no explanation and no markdown fences, preserving indentation and language. When asked a question, give a complete answer in Markdown (headings, code fences and lists allowed) including bugs found and corrected code as needed. You have no file or network access; answer only from internal knowledge.')
+      \ 'You are a helpful coding assistant inside Vim. You have no file or network access; answer only from internal knowledge. Your reply MUST begin on the very first line, with nothing before it, with exactly one routing token and nothing else on that line: <_incode_> if you are providing replacement code for the selected code, or <_scratchpad_> if you are providing an explanation or answer to show in a separate Markdown scratchpad window without changing the code. After that token line: for <_incode_>, return ONLY the replacement code, no explanation and no markdown fences, preserving indentation and language; for <_scratchpad_>, give a complete answer in Markdown (headings, code fences and lists allowed) including bugs found and corrected code as needed. Decide the token from the user intent yourself: choose <_incode_> only when the user wants the selected code changed and a selection is provided, otherwise choose <_scratchpad_>. If no selection is provided, always choose <_scratchpad_>. Never put anything before the token line.')
 
 let g:ai_debug = get(g:, 'ai_debug', 0)
 
@@ -88,6 +97,7 @@ let s:last_content = ''
 let s:last_request_json = ''
 let s:last_usage = ''
 let s:last_mode = 'code'
+let s:last_route = ''
 " pending :Ai prompt (scratch buffer) — selection/range captured before
 " the prompt opens, so submitting can resume in the original window.
 let s:pending_prompt = {}
@@ -177,48 +187,73 @@ function! s:ThinkingDesc() abort
   return string(g:ai_thinking)
 endfunction
 
-" Is this prompt a question ("is this okay", "is get_chunk correct",
-" "explain/review/check ...") rather than a code-modification request
-" ("rewrite this", "implement add", "fix this")? Questions open in a
-" Markdown buffer and never touch the code; modification requests replace
-" the selection. Rewrite verbs win over trailing "?" / trigger words so
-" "fix this bug" stays code.
-function! s:IsQuestion(q) abort
-  let l:q = substitute(tolower(a:q), '^\s\+', '', '')
-  if l:q ==# ''
-    return 0
+" The model — not Vim keyword-matching — decides whether a reply is code
+" to splice into the selection or a Markdown answer for the scratchpad.
+" It is instructed (system prompt + every request, so a custom
+" g:ai_system cannot break routing) to begin its reply with exactly one
+" routing token on the very first line: <_incode_> or <_scratchpad_>.
+" Returns [mode, body, route] where mode is 'code' or 'markdown', body
+" is the reply with the token line stripped, and route describes how the
+" mode was chosen (shown by :Ait). No token at all defaults to the
+" scratchpad: an untokened reply never overwrites code.
+function! s:SplitMode(text) abort
+  let l:lines = split(a:text, "\n", 1)
+  while len(l:lines) > 0 && l:lines[0] =~ '^\s*$'
+    call remove(l:lines, 0)
+  endwhile
+  if empty(l:lines)
+    return ['markdown', '', 'empty reply (defaulted to scratchpad)']
   endif
-  if l:q =~ '^\(rewrite\|refactor\|reimplement\|implement\|complete\|fill\|write\|generate\|create\|add\|insert\|fix\|correct\|modify\|change\|update\|optimize\|optimise\|simplify\|translate\|convert\|remove\|delete\|rename\|make\|build\|produce\|return\|replace\|finish\|port\|clean\|tidy\|format\|modernize\|modernise\|upgrade\|improve\|enhance\|extend\|expand\)\>'
-    return 0
-  endif
-  if l:q =~ '?$'
-    return 1
-  endif
-  if l:q =~ '^\(is\|are\|was\|were\|do\|does\|did\|can\|could\|should\|would\|will\|shall\|may\|might\|what\|why\|how\|when\|where\|which\|who\|whom\|whose\|explain\|describe\|review\|check\|tell\|show\|give\|list\|summarize\|summarise\|analyze\|analyse\|evaluate\|assess\|inspect\|verify\|debug\|discuss\|comment\|critique\)\>'
-    return 1
-  endif
-  if l:q =~ '\<\(correct\|okay\|bug\|buggy\|wrong\|safe\|efficient\|better\|problem\|issue\|overflow\|leak\|race\|undefined\|error\)\>'
-    return 1
-  endif
-  return 0
+  let l:first = trim(l:lines[0])
+  let l:low = tolower(l:first)
+  for l:pair in [['<_incode_>', 'code', 'model token <_incode_>'],
+        \ ['<_scratchpad_>', 'markdown', 'model token <_scratchpad_>']]
+    if l:low ==# l:pair[0] || l:low =~# '^' . l:pair[0] . '\s'
+      " token alone, or token followed by the first body line on the
+      " same line (tolerated, though the prompt asks for its own line).
+      let l:body_lines = []
+      let l:rest = trim(l:first[len(l:pair[0]) :])
+      if !empty(l:rest)
+        call add(l:body_lines, l:rest)
+      endif
+      call extend(l:body_lines, l:lines[1 :])
+      return [l:pair[1], join(l:body_lines, "\n"), l:pair[2]]
+    endif
+  endfor
+  return ['markdown', a:text, 'no routing token (defaulted to scratchpad)']
 endfunction
 
-function! s:BuildPayload(question, selection, has_selection, is_question, ft, fname) abort
+function! s:BuildPayload(question, selection, has_selection, ft, fname) abort
+  " Routing contract, repeated in every request so routing survives a
+  " custom g:ai_system. The model must put its decision — code splice
+  " or scratchpad answer — in the first-line token; Vim does no
+  " question-vs-edit guessing on the user's wording.
+  let l:route = "Your reply MUST begin on the very first line, with nothing before it, "
+        \ . "with exactly one of these two tokens and nothing else on that line:\n"
+        \ . "<_incode_>  Only if you are giving replacement code for the selected code/text below. "
+        \ . "After the token line, give ONLY the replacement code: no explanation, no Markdown, no code fences, "
+        \ . "preserving indentation and language. The plugin will splice it into the selection in Vim.\n"
+        \ . "<_scratchpad_>  If you are explaining, answering, reviewing, or giving code as an example to read "
+        \ . "rather than to splice in. After the token line, give a complete Markdown answer "
+        \ . "(headings, lists and fenced code blocks allowed), including any bugs found and corrected code. "
+        \ . "The plugin will show it in a Markdown scratchpad window in Vim and will NOT change the code.\n"
+        \ . "Decide the token yourself from the user intent. Choose <_incode_> only when the user wants the "
+        \ . "selected code changed. In every other case — a question, a review, an explanation, or anything "
+        \ . "informational — choose <_scratchpad_>. Never put a greeting, preamble, heading or code fence before "
+        \ . "the token line; the token is the first thing in your reply."
   if !a:has_selection
     " Blank canvas: ChatGPT-style quickshot. Only the question is sent.
-    let l:user = "Question:\n" . a:question . "\n\nAnswer in Markdown."
+    " With nothing to splice into, <_incode_> is meaningless, so the
+    " model is told to always pick the scratchpad.
+    let l:user = "You are in Vim. No code selection was provided, so there is nothing to replace; "
+          \ . "always choose <_scratchpad_>.\nQuestion:\n" . a:question . "\n\n" . l:route
   else
     let l:where = empty(a:fname) ? 'untitled' : a:fname
     if !empty(a:ft)
       let l:where = l:where . ' (' . a:ft . ')'
     endif
-    if !a:is_question
-      let l:user = "File: " . l:where . "\nInstruction:\n" . a:question . "\n\nSelected code/text:\n```\n" . a:selection . "\n```\n\n"
-            \ . 'Return ONLY the replacement for the selection. Do not add explanation or text outside it.'
-    else
-      let l:user = "File: " . l:where . "\nQuestion:\n" . a:question . "\n\nSelected code/text:\n```\n" . a:selection . "\n```\n\n"
-            \ . 'Answer the question about the selected code in Markdown. Do NOT return a replacement for the code. Include bugs found and, if helpful, corrected code in fenced code blocks.'
-    endif
+    let l:user = "You are in Vim. File: " . l:where . "\nUser request:\n" . a:question
+          \ . "\n\nSelected code/text:\n```\n" . a:selection . "\n```\n\n" . l:route
   endif
   let l:payload = {
         \ 'model': g:ai_model,
@@ -418,7 +453,8 @@ function! s:ApplyReplace(line1, line2, resp_text) abort
   call cursor(a:line1 + len(l:newlines) - 1, 1)
 endfunction
 
-" Show a question answer as Markdown in a scratch window below the
+" Show a scratchpad (<_scratchpad_>, or untokened / no-selection)
+" answer as Markdown in a scratch window below the
 " current one. The code buffer is never modified; :q (or :close) dismisses
 " the response and wipes the scratch buffer. Markdown is kept verbatim,
 " including fenced code blocks.
@@ -603,13 +639,14 @@ endfunction
 
 function! s:RunAi(question, line1, line2, selection, has_selection, range_desc, ft, fname) abort
   let l:question = a:question
-  " Blank canvas is always a question (nothing to replace).
-  let l:is_question = !a:has_selection ? 1 : s:IsQuestion(l:question)
+  " No keyword routing here: the model picks <_incode_> (splice into the
+  " selection) or <_scratchpad_> (Markdown scratch window) in its reply,
+  " and s:SplitMode() below routes on that token alone.
   " echo (not echom) for transient status: the window switch below cannot
   " be in "chunk mode". echom here would pause for press-ENTER.
   echo 'Ai: asking ' . g:ai_model . ' ...'
   redraw
-  let l:payload = s:BuildPayload(l:question, a:selection, a:has_selection, l:is_question, a:ft, a:fname)
+  let l:payload = s:BuildPayload(l:question, a:selection, a:has_selection, a:ft, a:fname)
   let l:result = s:CallOpenRouter(l:payload)
   let s:last_question = l:question
   let s:last_selection = a:selection
@@ -622,6 +659,8 @@ function! s:RunAi(question, line1, line2, selection, has_selection, range_desc, 
     let s:last_reasoning = get(l:result, 'reasoning', '')
     let s:last_content = get(l:result, 'content', '')
     let s:last_usage = get(l:result, 'usage', '')
+    let s:last_route = 'request failed (no routing)'
+    let s:last_mode = 'markdown'
     if has_key(l:result, 'raw')
       let s:last_content = l:result.raw . "\n(ERROR) " . l:result.error
     endif
@@ -636,14 +675,15 @@ function! s:RunAi(question, line1, line2, selection, has_selection, range_desc, 
   let s:last_reasoning = l:result.reasoning
   let s:last_content = l:result.content
   let s:last_usage = l:result.usage
-  " Query-driven routing: questions open as Markdown below and never
-  " modify the code; modification queries (selection required) replace
-  " the selection. Blank canvas always routes to Markdown.
-  if l:is_question
-    let s:last_mode = 'markdown'
-    let s:last_range = a:range_desc . ' (answer in Markdown window below)'
-    call s:ShowMarkdownResponse(l:result.content)
-  else
+  " Model-driven routing: the reply's first-line token decides.
+  " <_incode_> (with a selection) splices the body into the selection;
+  " <_scratchpad_> — and any untokened reply — opens the body as
+  " Markdown below and never touches the code. <_incode_> with no
+  " selection has nothing to splice into, so it degrades to the
+  " scratchpad rather than editing at the cursor.
+  let [l:mode, l:body, l:route] = s:SplitMode(l:result.content)
+  let s:last_route = l:route
+  if l:mode ==# 'code' && a:has_selection
     let s:last_mode = 'code'
     " whole-buffer replace touches parts outside any smaller selection:
     " ask first. Smaller explicit ranges are the selection itself.
@@ -654,7 +694,15 @@ function! s:RunAi(question, line1, line2, selection, has_selection, range_desc, 
       endif
     endif
     let s:last_range = a:line1 . ',' . a:line2
-    call s:ApplyReplace(a:line1, a:line2, l:result.content)
+    call s:ApplyReplace(a:line1, a:line2, l:body)
+  else
+    let s:last_mode = 'markdown'
+    if l:mode ==# 'code'
+      let s:last_range = a:range_desc . ' (model chose <_incode_> but there is no selection; shown in scratchpad)'
+    else
+      let s:last_range = a:range_desc . ' (answer in Markdown window below)'
+    endif
+    call s:ShowMarkdownResponse(l:body)
   endif
   " clear stale visual marks so a later bare :Ai is a blank canvas again.
   call setpos("'<", [0, 0, 0, 0])
@@ -680,10 +728,11 @@ function! Ait() abort
     call add(l:lines, 'Nitro: on (sort=throughput)')
   endif
   if s:last_mode ==# 'markdown'
-    call add(l:lines, 'Mode: markdown (question answer in scratch window below; code untouched)')
+    call add(l:lines, 'Mode: markdown (answer in scratch window below; code untouched)')
   else
     call add(l:lines, 'Mode: code (selection replaced)')
   endif
+  call add(l:lines, 'Routing: ' . (empty(get(s:, 'last_route', '')) ? '(n/a)' : s:last_route))
   call add(l:lines, 'Range: ' . s:last_range)
   call add(l:lines, 'Usage: ' . (empty(s:last_usage) ? '(none)' : s:last_usage))
   call add(l:lines, '')
