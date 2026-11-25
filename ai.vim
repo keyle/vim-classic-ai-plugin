@@ -53,7 +53,9 @@
 "   let g:ai_model = 'meta/muse-ember'
 "   let g:ai_thinking = 'max'   " low|medium|high|max|xhigh|minimal|none
 "   let g:ai_nitro = 1             " 1 => provider sort=throughput (fastest)
-"   let g:ai_response_height = 42  " height of the Markdown answer window
+"   let g:ai_response_height = 42  " height of the Markdown answer window;
+"                                " unset/0/negative => &lines - 25 (auto,
+"                                " computed when the answer opens)
 "   let g:ai_prompt_height = 5     " height of the :Ai question prompt window
 "   " API key is read ONLY from the environment variable
 "   " $OPENROUTER_API_KEY — export it in your shell before starting Vim.
@@ -78,7 +80,10 @@ let g:ai_provider_sort = get(g:, 'ai_provider_sort', '')
 let g:ai_provider_order = get(g:, 'ai_provider_order', [])
 let g:ai_api_url = get(g:, 'ai_api_url', 'https://openrouter.ai/api/v1/chat/completions')
 let g:ai_prompt_height = get(g:, 'ai_prompt_height', 5)
-let g:ai_response_height = get(g:, 'ai_response_height', 42)
+" 0/negative (or unset) => auto: &lines - 25, computed when the answer
+" window opens, so it tracks the terminal size instead of a fixed 42.
+" A positive number fixes the height in lines.
+let g:ai_response_height = get(g:, 'ai_response_height', 0)
 let g:ai_system = get(g:, 'ai_system',
       \ 'You are a helpful coding assistant inside Vim. You have no file or network access; answer only from internal knowledge. Your reply MUST begin on the very first line, with nothing before it, with exactly one routing token and nothing else on that line: <_incode_> if you are providing replacement code for the selected code, or <_scratchpad_> if you are providing an explanation or answer to show in a separate Markdown scratchpad window without changing the code. After that token line: for <_incode_>, return ONLY the replacement code, no explanation and no markdown fences, preserving indentation and language; for <_scratchpad_>, give a complete answer in Markdown (headings, code fences and lists allowed) including bugs found and corrected code as needed. Decide the token from the user intent yourself: choose <_incode_> only when the user wants the selected code changed and a selection is provided, otherwise choose <_scratchpad_>. If no selection is provided, always choose <_scratchpad_>. Never put anything before the token line.')
 
@@ -453,8 +458,31 @@ function! s:ApplyReplace(line1, line2, resp_text) abort
   call cursor(a:line1 + len(l:newlines) - 1, 1)
 endfunction
 
-" Show a scratchpad (<_scratchpad_>, or untokened / no-selection)
-" answer as Markdown in a scratch window below the
+" Height: a positive g:ai_response_height fixes the window in lines;
+" 0/negative (the default) is auto — &lines - 25, so Vim keeps 25 lines
+" for the code window and the answer takes the rest of the screen,
+" whatever the terminal size. Clamped to >= 1 and to the available
+" screen space (minus the windows already shown) so a tiny screen
+" cannot make the split fail.
+function! s:ResponseHeight() abort
+  let l:height = g:ai_response_height
+  if type(l:height) != type(0) || l:height <= 0
+    let l:height = &lines - 25
+  endif
+  if l:height < 1
+    let l:height = 1
+  endif
+  let l:max = &lines - 2 - winnr('$')
+  if l:max < 1
+    let l:max = 1
+  endif
+  if l:height > l:max
+    let l:height = l:max
+  endif
+  return l:height
+endfunction
+
+" Show a scratchpad answer as Markdown in a scratch window below the
 " current one. The code buffer is never modified; :q (or :close) dismisses
 " the response and wipes the scratch buffer. Markdown is kept verbatim,
 " including fenced code blocks.
@@ -470,11 +498,7 @@ function! s:ShowMarkdownResponse(resp_text) abort
     echom 'Ai: response is empty; nothing shown.'
     return
   endif
-  let l:height = g:ai_response_height
-  if type(l:height) != type(0) || l:height < 1
-    let l:height = 15
-  endif
-  execute 'belowright ' . l:height . 'new'
+  execute 'belowright ' . s:ResponseHeight() . 'new'
   setlocal buftype=nofile bufhidden=wipe noswapfile
   setlocal nonumber norelativenumber wrap
   setlocal filetype=markdown
